@@ -1,0 +1,10 @@
+﻿Start Order (Heater/Stirrer/Both),Heater
+Logging (On/Off),On
+Temperature Setpoint,100
+Temperature Ramp,5
+Temperature Dwell,45
+Stirrer Setpoint 1,400
+Stirrer Ramp 1,20
+Stirrer Dwell 1,10
+Stirrer Setpoint 2,550
+Stirrer Ramp 2,75
