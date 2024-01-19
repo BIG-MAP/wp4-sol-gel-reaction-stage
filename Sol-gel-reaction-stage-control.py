@@ -4,9 +4,11 @@ Created on Mon Jun  5 12:10:23 2023
 
 @author: thobson
 This version is desinged to work with an Arduino UNO microcontroller connected over LAN
-Arduino must be loaded with the sketch 'EthernetReceiveSendBinary4_0.ino'
+Arduino must be loaded with the sketch 'EthernetReceiveSendBinary4_2.ino'
 Microcontroller will send/receive bytes from an RS9000 Orbit Shaker,
-connected via the (female) RS232 port
+connected via the (female) RS232 port (device address 40).
+Microcontroller will also send/recieve bytes from a second microcontroller (Arduino MKR, devfice address 8)
+to take external thermocouple temperature measurements.
 """
 
 import requests
@@ -22,6 +24,9 @@ import pandas as pd
 #------------------------------Fixed Values------------------------------------
 
 devaddr = 40 # Address of the Orbit Shaker, 40 is the default, but should be shown on startup
+thermaddr = 8 # Address of the MKR thermocouple board, can be changed in the control sketch for the MKR, which will also require changing in the sketch for the Uno
+valvaddr = 4 # Address of the gas valve, can be changed in sketch on Arduino Uno
+
 IP_addr = "138.253.143.253" # IP address of the mictrocontroller on LAN network (can be changed in sketch)
 sg.theme('SystemDefault')
 
@@ -46,6 +51,8 @@ sound_sh_on = False
 sound_m_on = False
 sound_l_on = False
 
+valvopen = False
+
 on_off = 0  # Initially set to 0 as byte defined by adding
 
 first_heat = False
@@ -55,7 +62,7 @@ first_both = True
 logs_on = False
 logs_started = False
 segs = 1
-log_step_size = 60.0    # The time period (in s) over which process parameters are logged
+log_step_size = 30.0    # The time period (in s) over which process parameters are logged
 
 t_set = 0    # Temperature setpoint in degrees C
 t_ramp_set = 0     # Temperature ramp rate in deg C per min
@@ -101,8 +108,11 @@ ram_agit_high = 41  # RAM address for speed setpoint
 ram_agit_low = 42
 ram_agit_ramp = 43  # RAM address for speed ramp
 
-ram_temp_meas_read_high = 39    # RAM address for temperature measurement
+ram_temp_meas_read_high = 39    # RAM address for temperature measurement (internal)
 ram_temp_meas_read_low = 40
+
+ram_temp_meas_ext_read_high = 1    # RAM address for temperature measurement from the thermocouple
+ram_temp_meas_ext_read_low = 0
 
 ram_agit_meas_read_high = 44    # # RAM address for speed measurement
 ram_agit_meas_read_low = 45
@@ -299,7 +309,7 @@ def Heat_Pow_Bin_Read(heat_bin):
 
 def Comm_Write(dvaddr, ramaddr, datbyte): # Function to write commands to RS9000 and confirm
 
-    payload = {'dv': str(devaddr), 'rv':str(ramaddr), 'dtv':str(datbyte)} # Define the values to send to the microcontroller            
+    payload = {'dv': str(dvaddr), 'rv':str(ramaddr), 'dtv':str(datbyte)} # Define the values to send to the microcontroller            
     r2 = requests.post('http://'+IP_addr+'/post', params = payload) # This is the line that sends the command values over the network
 
     HTML_string = r2.text # Makes a string of the HTML code in the request
@@ -320,33 +330,39 @@ def Comm_Write(dvaddr, ramaddr, datbyte): # Function to write commands to RS9000
 
 def Comm_Read(dvaddr, ramaddr): # Function to read values from RS9000 and confirm
 
-    payload = {'dv': str(devaddr), 'rv':str(ramaddr+128)} # 128 is always added to RAM addresses for reading, as machine interprets highest bit of '1' as read operation           
+    payload = {'dv': str(dvaddr), 'rv':str(ramaddr+128)} # 128 is always added to RAM addresses for reading, as machine interprets highest bit of '1' as read operation           
     r2 = requests.post('http://'+IP_addr+'/post', params = payload) # This is the line that sends the command values over the network
 
     HTML_string = r2.text # Makes a string of the HTML code in the request
     
     sub_ind1 = HTML_string.index("""id="cs""") # Finds where checksum (cs) is first defined in HTML
     cs_sub_string = HTML_string[sub_ind1:HTML_string.index("><br>", sub_ind1)] # Takes out the substring where the cs value is defined
-    # print(cs_sub_string) # Uncomment for debugging
+    print("cs_substring: "+cs_sub_string) # Uncomment for debugging
     cs_str = cs_sub_string[-(len(cs_sub_string)-24):] # Substring will contain 24 characters then the value, these last characters are the cs value
     
 
     sub_ind2 = HTML_string.index("""id="dr""") # Finds where data read (dr) is first defined in HTML
     dr_sub_string = HTML_string[sub_ind2:HTML_string.index("><br>", sub_ind2)] # Takes out the substring where the dr value is defined
-    # print(dr_sub_string) # Uncomment for debugging
+    print("dr_substring: "+dr_sub_string) # Uncomment for debugging
     dr_str = dr_sub_string[-(len(dr_sub_string)-24):] # Substring will contain 24 characters then the value, these last characters are the dr value
     
 
     return (cs_str, dr_str)
+
+    
 
 #----------------------------Simple Byte Reading Functions -----------------------
 
 def One_Byte_Read(dvaddr,ram_addr): # Simple function to read the data byte of a given address
             chks_str = '-1'
             datr_str = '-1'
+
+            print("Device address: "+str(dvaddr))
+            print("RAM address: "+str(ram_addr))
         
-            chks_str, datr_str = Comm_Read(devaddr, ram_addr)  # Reads the current speed to take as starting point for ramping
+            chks_str, datr_str = Comm_Read(dvaddr, ram_addr)  # Reads the current speed to take as starting point for ramping
             byte_read = int(datr_str)
+            print("Single byte: "+str(byte_read))
             
             return(byte_read)
 
@@ -354,30 +370,38 @@ def One_Byte_Read(dvaddr,ram_addr): # Simple function to read the data byte of a
 def Two_Byte_Read(dvaddr,ram_high,ram_low): # Same as above, but for reading the high and low bytes of a parameter
             chks_str = '-1'
             datr_str = '-1'
+
+            print("Device address: "+str(dvaddr))
+            print("RAM address high: "+str(ram_high))
+            print("RAM address low: "+str(ram_low))
+            
         
-            chks_str, datr_str = Comm_Read(devaddr, ram_high)  # Reads the current speed to take as starting point for ramping
+            chks_str, datr_str = Comm_Read(dvaddr, ram_high)  # Reads the current speed to take as starting point for ramping
             byte_high = int(datr_str)
+            print("High byte: "+str(byte_high))
         
-            chks_str, datr_str = Comm_Read(devaddr, ram_low)
+            chks_str, datr_str = Comm_Read(dvaddr, ram_low)
             byte_low = int(datr_str)
+            print("Low byte: "+str(byte_low))
             
             return(byte_high,byte_low)
 
 #---------------------------Log Saving Function--------------------------------
 
 
-def Save_Logs(l_dict,l_headings,time_list,temp_sp_list,temp_m_list,speed_sp_list,speed_m_list,\
+def Save_Logs(l_dict,l_headings,time_list,temp_sp_list,temp_m_list,temp_m_ext_list,speed_sp_list,speed_m_list,\
               heat_pow_list,stirr_stat_list,err_stat_list,proc_stat_list):
     
             l_dict[l_headings[0]] = time_list
             l_dict[l_headings[1]] = temp_sp_list
             l_dict[l_headings[2]] = temp_m_list
-            l_dict[l_headings[3]] = speed_sp_list
-            l_dict[l_headings[4]] = speed_m_list
-            l_dict[l_headings[5]] = heat_pow_list
-            l_dict[l_headings[6]] = stirr_stat_list
-            l_dict[l_headings[7]] = err_stat_list
-            l_dict[l_headings[8]] = proc_stat_list
+            l_dict[l_headings[3]] = temp_m_ext_list
+            l_dict[l_headings[4]] = speed_sp_list
+            l_dict[l_headings[5]] = speed_m_list
+            l_dict[l_headings[6]] = heat_pow_list
+            l_dict[l_headings[7]] = stirr_stat_list
+            l_dict[l_headings[8]] = err_stat_list
+            l_dict[l_headings[9]] = proc_stat_list
 
             df_log = pd.DataFrame(l_dict,columns=l_headings)
 
@@ -438,6 +462,8 @@ def Set_On_Off(str_on, ht_on, snd_sh_on, snd_m_on, snd_l_on, daddr, rm_HS_OnOff,
 ##            print("On/Off settings confirmed")
 
 def Temp_Set(t_set, max_wait):
+
+        print("Running temp set.")
 
         temp_set_bytes = Temp_Set_Bin(t_set) # Function returns array with two values, the high and low bytes
         temp_set_byte_high = temp_set_bytes[0]
@@ -715,6 +741,54 @@ def Set_Speed_Ramp(a_ramp_set, max_wait):
         if (int(dr_str) == agit_ramp_set_byte):        
             print('Speed ramp set confirmed at '+str(agit_ramp_set_byte))
 
+def Set_Gas_Valve(valve_on,ram_r_wr):   # Function to send a command to open valve (really just a pin output high on the relay connnection)
+    
+    cs_str = '-1'
+    dr_str = '-1'
+    valve_is_on = "Off"
+    
+    if (valve_on == True):
+        valve_set = 1
+
+    if (valve_on == False):
+        valve_set = 0
+
+    if (ram_r_wr == 1): # To confirm it is a write command
+        try:
+            Comm_Write(valvaddr,ram_r_wr,valve_set)
+            if (valve_on == True):
+                valve_is_on = "On"
+            if (valve_on == False):
+                valve_is_on = "Off"
+        except:
+            print("Could not send command to valve")
+
+    else:
+        print("Valve or RAM address incorrect, treating valve as off, but status unknown")  # Stand-in message as I have currently been unable to get the read function to work
+        
+
+    return(valve_is_on)
+
+def Read_Gas_Valve(ram_r_wr):   # Function 
+    cs_str = '-1'
+    dr_str = '-1'
+    valve_is_on = "Unkn"
+
+    if (ram_r_wr == 0):
+        try:
+            cs_str, dr_str = Comm_Read(valvaddr,ram_r_wr)
+            if (dr_str == '1'):
+                valve_is_on = "On"
+            if (dr_str == '0'):
+                valve_is_on = "Off"
+        except:
+            print("Could not send command to valve")
+
+    else:
+        print("Valve or RAM address incorrect")
+
+    return(valve_is_on)
+
 #-------------------Function to Generate List of Speed Setpoints and Ramps-------------
             
 def Get_Ramp_List(steps_s,steps_r,a_speed_0,a_speed_set,a_ramp_set,dwell_time_sp):
@@ -777,7 +851,7 @@ def Menu_Dialog():
             
         if (event == '-MANUAL-'):
             print("Running manual control")
-            Manual_Control_Dialog(stirr_on, heat_on, sound_sh_on, sound_m_on, sound_l_on, devaddr, ram_HS_OnOff, max_wait)
+            Manual_Control_Dialog(stirr_on, heat_on, sound_sh_on, sound_m_on, sound_l_on, valvopen, devaddr, ram_HS_OnOff, max_wait, logs_started)
         
         
         if ((event == '-QUIT-') or (event == sg.WINDOW_CLOSED)):
@@ -785,7 +859,7 @@ def Menu_Dialog():
         
     window_0.close()
 
-def Manual_Control_Dialog(stirr_on, heat_on, sound_sh_on, sound_m_on, sound_l_on, devaddr, ram_HS_OnOff, max_wait):
+def Manual_Control_Dialog(stirr_on, heat_on, sound_sh_on, sound_m_on, sound_l_on, valvopen, devaddr, ram_HS_OnOff, max_wait, logs_started):
 
     line0 = sg.Text("Manual On/Off Options",font=('Arial Bold',16))
     
@@ -798,6 +872,8 @@ def Manual_Control_Dialog(stirr_on, heat_on, sound_sh_on, sound_m_on, sound_l_on
     b011 = sg.Button("Sounder Short", key='-SOUNDSHRT-', button_color='navy')
     b012 = sg.Button("Sounder Medium", key = '-SOUNDMED-', button_color='navy')
     b013 = sg.Button("Sounder Long", key='-SOUNDLONG-', button_color='navy')
+    b014 = sg.Button("Valve Closed", key='-VALVCLSD-', button_color=('navy','white'))
+    b015 = sg.Button("Valve Open", key='-VALVOPEN-', button_color='navy')
     
     line10 = sg.Text('Manual Process Parameters',font=('Arial Bold',16))
     
@@ -813,11 +889,12 @@ def Manual_Control_Dialog(stirr_on, heat_on, sound_sh_on, sound_m_on, sound_l_on
     line4 = sg.Text("Enter speed ramp in minues to setpoint, (0.1 minute precision)", key='-OUT-',expand_x=True, justification='left')
     box4 = sg.Input('', enable_events=True,key='-INPUT4-', expand_x=True, justification='left')
     
-    send_a_1 = sg.Button("Send", key='-SENDONOFF-', button_color='navy')
+    send_a_1 = sg.Button("Send On/Off", key='-SENDONOFF-', button_color='navy')
     send_b_1 = sg.Button("Send Temp Set", key='-SENDTS-', button_color='navy')
     send_b_2 = sg.Button("Send Temp Ramp", key='-SENDTR-', button_color='navy')
     send_b_3 = sg.Button("Send Stirr Set", key='-SENDSS-', button_color='navy')
     send_b_4 = sg.Button("Send Stirr Ramp", key='-SENDSR-', button_color='navy')
+    send_c_1 = sg.Button("Send Valve Set", key='-SENDVALV-', button_color='navy')
     
     back_b = sg.Button("Back", key='-BACK-',button_color='navy')
     end_b = sg.Button("Finish", key='-FINISH-', button_color='navy')
@@ -825,6 +902,7 @@ def Manual_Control_Dialog(stirr_on, heat_on, sound_sh_on, sound_m_on, sound_l_on
     layout_1 = [[line0],\
               [l01,b01],[l02,b02],[l03,b011,b012,b013],\
               [send_a_1],\
+              [b014,b015,send_c_1],
               [],\
               [line10],\
               [line1],[box1,send_b_1],\
@@ -888,10 +966,23 @@ def Manual_Control_Dialog(stirr_on, heat_on, sound_sh_on, sound_m_on, sound_l_on
             sound_l_on = True
             sound_sh_on = False
             sound_m_on = False
+
+        if (event == '-VALVCLSD-'):
+            window_1['-VALVCLSD-'].update(button_color=('navy','white'))
+            window_1['-VALVOPEN-'].update(button_color=('white','navy'))
+            valvopen = False
+
+        if (event == '-VALVOPEN-'):
+            window_1['-VALVOPEN-'].update(button_color=('navy','white'))
+            window_1['-VALVCLSD-'].update(button_color=('white','navy'))
+            valvopen = True
             
         if (event == '-SENDONOFF-'): # This sends the settings to the microcontroller to send to orbit shaker
     
             Set_On_Off(stirr_on, heat_on, sound_sh_on, sound_m_on, sound_l_on, devaddr, ram_HS_OnOff, max_wait)
+
+        if (event == '-SENDVALV-'):
+            Set_Gas_Valve(valvopen,1)
         
         if (event == "-SENDTS-"):
             print("Temp setpoint = "+values["-INPUT1-"]+" C")
@@ -922,9 +1013,13 @@ def Manual_Control_Dialog(stirr_on, heat_on, sound_sh_on, sound_m_on, sound_l_on
             Set_Speed_Ramp(a_ramp_set, max_wait)
             
         if (event == '-FINISH-'):
-            Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,first_heat,\
-                               heat_on,stirr_on,timer_started,timer_stopped,\
-                               proc_status,ramp_1_0_time,logs_on,logs_started)
+            try:
+                Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,first_heat,\
+                                   heat_on,stirr_on,timer_started,timer_stopped,\
+                                   proc_status,ramp_1_0_time,logs_on,logs_started)
+            except:
+                sg.popup("Process monitor could not be started, please check input parameters and try again")
+                print("Process monitor could not be started, please check input parameters and try again")
             break
         
         if ((event == '-BACK-') or (event == sg.WIN_CLOSED)):
@@ -966,10 +1061,16 @@ def Process_Setup_Dialog():
     
     line2_9 = sg.Text("(Dwell time for stirrer will be matched to temp dwell)", key='-OUT-',expand_x=True, justification='left')
     
-    line2_10 = sg.Text("Start order for heating and stirring", font=('Arial Bold',14))
+    line2_10 = sg.Text("Start order for heating and stirring", font=('Arial Bold',12))
     b2_10 = sg.Button("Heater First",key='-HEAT1ST-', button_color='navy')
     b2_11 = sg.Button("Stirrer First", key='-STIRR1ST-', button_color='navy')
     b2_12 = sg.Button("Same Time", key = '-BOTH1ST-', button_color=('navy', 'white'))
+
+    line2_11 = sg.Text("Gas valve opening trigger", font=('Arial Bold',12))
+    b2_13 = sg.Button("Manual", key='-MANTRIG-', button_color=('navy','white'))
+    b2_14 = sg.Button("Top Temp", key='-HEATTRIG-', button_color='navy')
+    b2_15 = sg.Button("Top Speed", key='-AGITTRIG-', button_color='navy')
+    b2_16 = sg.Button("Both Top", key='-BOTHTRIG-', button_color='navy')
     
     start_b_2 = sg.Button("Start Process", key='-START2-', button_color='navy')
     end_b_2 = sg.Button("Back", key='-QUIT2-', button_color='navy')
@@ -993,18 +1094,22 @@ def Process_Setup_Dialog():
               [],\
               [line2_10],\
               [b2_10, b2_11, b2_12],\
+              [line2_11],\
+              [b2_13, b2_14, b2_15, b2_16],\
               [log_b_1,log_b_2],\
               [start_b_2],\
             
               [end_b_2]]
     
-    window_2 = sg.Window("Orbit Shaker Process Setup", layout_2, size=(750,520))
+    window_2 = sg.Window("Orbit Shaker Process Setup", layout_2, size=(750,580))
     
     dflt_ramp_on = True
 
     first_heat = False
     first_stirr = False
     first_both = True
+
+    valve_trig = "ManTrig"  # Assumes the gas valve will only trigger manually unless told otherwise
     
     while True:
         event, values = window_2.read() # 'window2' was defined in the dialog box setup
@@ -1037,6 +1142,36 @@ def Process_Setup_Dialog():
             first_heat = False
             first_stirr = False
             first_both = True
+
+        if (event == '-HEATTRIG-'):
+            window_2['-HEATTRIG-'].update(button_color=('navy','white'))
+            window_2['-AGITTRIG-'].update(button_color=('white','navy'))
+            window_2['-BOTHTRIG-'].update(button_color=('white','navy'))
+            window_2['-MANTRIG-'].update(button_color=('white','navy'))
+            valve_trig = "HeatTrig"
+            
+        if (event == '-AGITTRIG-'):
+            window_2['-AGITTRIG-'].update(button_color=('navy','white'))
+            window_2['-HEATTRIG-'].update(button_color=('white','navy'))
+            window_2['-BOTHTRIG-'].update(button_color=('white','navy'))
+            window_2['-MANTRIG-'].update(button_color=('white','navy'))
+            valve_trig = "AgitTrig"
+            
+        if (event == '-BOTHTRIG-'):
+            window_2['-BOTHTRIG-'].update(button_color=('navy','white'))
+            window_2['-HEATTRIG-'].update(button_color=('white','navy'))
+            window_2['-AGITTRIG-'].update(button_color=('white','navy'))
+            window_2['-MANTRIG-'].update(button_color=('white','navy'))
+            valve_trig = "BothTrig"
+            
+        if (event == '-MANTRIG-'):
+            window_2['-MANTRIG-'].update(button_color=('navy','white'))
+            window_2['-HEATTRIG-'].update(button_color=('white','navy'))
+            window_2['-AGITTRIG-'].update(button_color=('white','navy'))
+            window_2['-BOTHTRIG-'].update(button_color=('white','navy'))
+            valve_trig = "ManTrig"
+            
+
     
         if (event == '-LOGON-'):
             logs_on = True
@@ -1252,7 +1387,7 @@ def Process_Setup_Dialog():
     
                 logs_started = False
                 
-                Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,first_heat,\
+                Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,first_heat,valve_trig,\
                                    heat_on,stirr_on,dwell_time,timer_started,timer_stopped,\
                                     proc_status,ramp_1_0_time,logs_on,logs_started)
                 sleep(0.01)
@@ -1266,7 +1401,7 @@ def Process_Setup_Dialog():
     
                 logs_started = False
                 
-                Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,first_heat,\
+                Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,first_heat,valve_trig,\
                                    heat_on,stirr_on,dwell_time,timer_started,timer_stopped,\
                                     proc_status,ramp_1_0_time,logs_on,logs_started)
                 
@@ -1282,7 +1417,7 @@ def Process_Setup_Dialog():
     
                 logs_started = False
                 
-                Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,first_heat,\
+                Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,first_heat,valve_trig,\
                                    heat_on,stirr_on,dwell_time,timer_started,timer_stopped,\
                                    proc_status,ramp_1_0_time,logs_on,logs_started)
                 
@@ -1300,16 +1435,19 @@ def Process_Setup_Dialog():
     window_2.close()
 
 
-def Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,first_heat,\
+def Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,first_heat,valve_trig,\
                    heat_on,stirr_on,dwell_time,timer_started,timer_stopped,\
                    proc_status,ramp_1_0_time,logs_on,logs_started):
+
 
     line3_0 = sg.Text("Process Monitor Dashboard",font=('Arial Bold',16))
     
     line3_1 = sg.Text("Temperature setpoint in C", key='-OUT-', font=('Arial',14), expand_x=True, justification='left')
     box3_1 = sg.StatusBar('0', enable_events=True,key='-OUTPUT3_1-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=True, justification='left')
-    line3_2 = sg.Text("Measured Temperature in C", key='-OUT-', font=('Arial',14), expand_x=True, justification='left')
+    line3_2 = sg.Text("Internal Temperature in C", key='-OUT-', font=('Arial',14), expand_x=True, justification='left')
     box3_2 = sg.StatusBar('0', enable_events=True,key='-OUTPUT3_2-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=True, justification='left')
+    line3_2_1 = sg.Text("External Temperature in C", key='-OUT-', font=('Arial',14), expand_x=True, justification='left')
+    box3_2_1 = sg.StatusBar('0', enable_events=True,key='-OUTPUT3_2_1-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=True, justification='left')
     line3_3 = sg.Text("Stirrer setpoint in RPM", key='-OUT-', font=('Arial',14), expand_x=True, justification='left')
     box3_3 = sg.StatusBar('0', enable_events=True,key='-OUTPUT3_3-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=True, justification='left')
     line3_4 = sg.Text("Measured stirrer speed in RPM", key='-OUT-', font=('Arial',14), expand_x=True, justification='left')
@@ -1327,9 +1465,9 @@ def Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,
     box3_9 = sg.StatusBar('No errors', enable_events=True,key='-OUTPUT3_9-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=True, justification='left')
     
     line3_10 = sg.Text("Progress", key='-OUT-',font=('Arial',14), expand_x=True, justification='left')
-    box3_10 = sg.StatusBar('Manual', enable_events=True,key='-OUTPUT3_10-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=True, justification='left')
-    
-    
+    box3_10 = sg.StatusBar('Manual', enable_events=True,key='-OUTPUT3_10-', font = ('Arial Bold', 18), text_color='lime', background_color='black', expand_x=False, justification='left')
+
+    valve_b_1 = sg.Button("Open Valve", key='-VALV-', button_color='navy')
     
     stop_b_3 = sg.Button("Stop Process", key='-STOP3-', button_color='navy')
     
@@ -1339,6 +1477,7 @@ def Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,
               [],\
               [line3_1,box3_1],\
               [line3_2,box3_2],\
+              [line3_2_1,box3_2_1],\
               [line3_3,box3_3],\
               [line3_4,box3_4],\
               [],\
@@ -1348,62 +1487,107 @@ def Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,
               [line3_8,box3_8],\
               [line3_9,box3_9],\
               [line3_10,box3_10],\
+              [valve_b_1],\
               [],\
               [stop_b_3],\
             
               [end_b_3]]
     
-    window_3 = sg.Window("Orbit Shaker Process Monitor", layout_3, size=(500,500))
+    window_3 = sg.Window("Orbit Shaker Process Monitor", layout_3, size=(500,600))
+
+    valve_status = Set_Gas_Valve(False,1)   # Closes gas valve during ramp up process
+    valve_triggered = False # Variable to keep track of whether the valve has been triggered yet, allowing users to manually open/close
     
     while True:
         event, values = window_3.read(timeout=1000) # 'window_3' was defined in the dialog box setup, timeout is time (in ms) before window refreshes
     
         time_0 = time()
     
+        if (event == '-VALV-'): # Lets the user manually open/close the gas valve during the process
+            if (valve_status == "Off"):
+                try:
+                    valve_status = Set_Gas_Valve(True,1)
+                    window_3['-VALV-'].update("Close Valve",button_color=('navy','white'))
+                except:
+                    print("Could not open gas valve")
+            elif (valve_status == "On"):
+                try:
+                    valve_status = Set_Gas_Valve(False,1)
+                    window_3['-VALV-'].update("Open Valve",button_color=('white','navy'))
+                except:
+                    print("Could not close gas valve")
+            
+    
         if ((logs_on == True) and (logs_started == False)):
             log_dict = {}
-            log_headings = ['Time (s)','Temp Setpoint (C)','Temp Measured (C)','Speed Setpoint (RPM)','Speed Measured (RPM)',\
+            log_headings = ['Time (s)','Temp Setpoint (C)','Temp Internal (C)','Temp External (C)','Speed Setpoint (RPM)','Speed Measured (RPM)',\
                             'Heater Power (%)','Stirrer Status (on/off)','Error Status','Process Status']
             
-            times, temp_sps, temp_ms, speed_sps, speed_ms, heat_pows, stirr_stats, err_stats, proc_stats = [],[],[],[],[],[],[],[],[]
+            times, temp_sps, temp_ms, temp_ex_ms, speed_sps, speed_ms, heat_pows, stirr_stats, err_stats, proc_stats = [],[],[],[],[],[],[],[],[],[]
     
             log_0 = time()
             log_step_0 = time()
     
             logs_started = True
+            
+        print("Valve status: "+valve_status)
         
         temp_set_high, temp_set_low = Two_Byte_Read(devaddr,ram_temp_high,ram_temp_low) # Read the bytes for temperature setpoint
         if ((temp_set_high != -1) and (temp_set_low != -1)):
             temp_set_read = Temp_Bin_Read(temp_set_high, temp_set_low) # Translate the bytes into the temperature setpoint reading on the RS9000
+            print("Temp set read: "+str(temp_set_read))
 
         temp_meas_high, temp_meas_low = Two_Byte_Read(devaddr,ram_temp_meas_read_high,ram_temp_meas_read_low)
         if ((temp_meas_high != -1) and (temp_meas_low != -1)):
             temp_meas = Temp_Bin_Read(temp_meas_high, temp_meas_low)
+            print("Temp meas read: "+str(temp_meas))
+
+        try:
+
+            temp_meas_ext_high, temp_meas_ext_low = Two_Byte_Read(thermaddr,ram_temp_meas_ext_read_high,ram_temp_meas_ext_read_low)
+            if ((temp_meas_ext_high != -1) and (temp_meas_ext_low != -1)):
+                if (len(str(temp_meas_ext_low))>2): # If the measured low value is more than two digits (e.g. 255) this is an error, likely because the thermocouple is grounded
+                    print("External thermocouple could not be read, junction may be grounded.")
+                else:
+                    temp_meas_ext = float(str(temp_meas_ext_high)+'.'+str(temp_meas_ext_low))
+                    print("Temp meas ext: "+str(temp_meas_ext))
+        except:
+            print("External thermocouple could not be read.")
+            print("Temp meas ext: "+str(temp_meas_ext))
             
         agit_set_high, agit_set_low = Two_Byte_Read(devaddr,ram_agit_high,ram_agit_low)
         if ((agit_set_high != -1) and (agit_set_low != -1)):
             agit_set_read = Agit_Bin_Read(agit_set_high, agit_set_low)
+            print("Agit set read: "+str(agit_set_read))
             
         agit_meas_high, agit_meas_low = Two_Byte_Read(devaddr,ram_agit_meas_read_high,ram_agit_meas_read_low)
         if ((agit_meas_high != -1) and (agit_meas_low != -1)):
             agit_meas_read = Agit_Bin_Read(agit_meas_high, agit_meas_low)
+            print("Agit meas read: "+str(agit_meas_read))
     
         heat_pow = One_Byte_Read(devaddr,ram_heat_pow)
         if (heat_pow != -1):
             heat_per = Heat_Pow_Bin_Read(heat_pow)
+            print("Heat per read: "+str(heat_per))
     
         on_off_val = One_Byte_Read(devaddr,ram_HS_OnOff)
+        print("On/Off value: "+str(on_off_val))
         if (on_off_val != -1):
-            heat_is_on, stirr_is_on = OnOff_Bin_Read(on_off_val)    
+            try:
+                heat_is_on, stirr_is_on = OnOff_Bin_Read(on_off_val)
+            except:
+                print("Could not read I/O status, byte transfer error")
             
         err_byte = One_Byte_Read(devaddr,ram_errors)
         if (err_byte != -1):
             error_str = Err_Bin_Read(err_byte)
+            print("Err str read: "+str(error_str))
     
     
                 
         window_3['-OUTPUT3_1-'].update(str(temp_set_read))
         window_3['-OUTPUT3_2-'].update(str(temp_meas))
+        window_3['-OUTPUT3_2_1-'].update(str(temp_meas_ext))
         window_3['-OUTPUT3_3-'].update(str(agit_set_read))
         window_3['-OUTPUT3_4-'].update(str(agit_meas_read))
         window_3['-OUTPUT3_5-'].update(str(heat_per))
@@ -1412,8 +1596,21 @@ def Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,
         window_3['-OUTPUT3_8-'].update(stirr_is_on)
         window_3['-OUTPUT3_9-'].update(error_str)
         window_3['-OUTPUT3_10-'].update(proc_status)
+
+        if (valve_status == "On"):
+            window_3['-VALV-'].update("Close Valve",button_color=('navy','white')) # Checks if the valve has been opened/closed automatically and updates the button appearance
+        if (valve_status == "Off"):
+            window_3['-VALV-'].update("Open Valve",button_color=('white','navy'))
     
         if ((first_both == True) and (timer_started == False)):
+
+            if(((temp_meas >= (temp_set_read-temp_tol)) and (temp_meas <= (temp_set_read+temp_tol))) and (valve_trig == "HeatTrig") and (valve_triggered == False)):
+                try:
+                    valve_status = Set_Gas_Valve(True,1)
+                    valve_triggered = True  # Ensures that once the valve has been automatically triggered, the user can manually operate it without it resetting
+                except:
+                    print("Could not open gas valve")
+                        
             
             if ((agit_meas_read >= (agit_set_read-agit_tol)) and (agit_meas_read <= (agit_set_read+agit_tol)) and (((time()-ramp_1_0_time)/60)>steps_r[step_num-1])):
     
@@ -1424,6 +1621,12 @@ def Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,
                     timer_started = True
                     proc_status = "Timer Start"
                     window_3['-OUTPUT3_10-'].update(proc_status)
+                    if (((valve_trig == "BothTrig") or (valve_trig == "AgitTrig")) and (valve_triggered == False)):
+                        try:
+                            valve_status = Set_Gas_Valve(True,1)
+                            valve_triggered = True # Ensures that once the valve has been automatically triggered, the user can manually operate it without it resetting
+                        except:
+                            print("Could not open gas valve")
                     
                 if (step_num < len(steps_s)):
                     print("Partial ramp step reached")
@@ -1449,6 +1652,12 @@ def Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,
                     Set_On_Off(stirr_on, heat_on, sound_sh_on, sound_m_on, sound_l_on, devaddr, ram_HS_OnOff, max_wait)
                     proc_status = "RampHeat"
                     window_3['-OUTPUT3_10-'].update(proc_status)
+                    if ((valve_trig == "AgitTrig") and (valve_triggered == False)):
+                        try:
+                            valve_status = Set_Gas_Valve(True,1)
+                            valve_triggered = True # Ensures that once the valve has been automatically triggered, the user can manually operate it without it resetting
+                        except:
+                            print("Could not open gas valve")
                     
                 if ((step_num < len(steps_s)) and (heat_on == False)):
                     print("Partial ramp step reached")
@@ -1470,17 +1679,29 @@ def Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,
                 timer_started = True
                 proc_status = "Timer Start"
                 window_3['-OUTPUT3_10-'].update(proc_status)
+                if (((valve_trig == "HeatTrig") or (valve_trig == "BothTrig")) and (valve_triggered == False)):
+                    try:
+                        valve_status = Set_Gas_Valve(True,1)
+                        valve_triggered = True # Ensures that once the valve has been automatically triggered, the user can manually operate it without it resetting
+                    except:
+                        print("Could not open gas valve")
                 
     
         if ((first_heat == True) and (timer_started == False)):
     
-            if((temp_meas >= (temp_set_read-temp_tol)) and (temp_meas <= (temp_set_read+agit_tol)) and (stirr_on == False)):
+            if((temp_meas >= (temp_set_read-temp_tol)) and (temp_meas <= (temp_set_read+temp_tol)) and (stirr_on == False)):
     
                     print("Starting Stirrer")
                     stirr_on = True
                     Set_On_Off(stirr_on, heat_on, sound_sh_on, sound_m_on, sound_l_on, devaddr, ram_HS_OnOff, max_wait)
                     proc_status = "RampStirr"
                     window_3['-OUTPUT3_10-'].update(proc_status)
+                    if ((valve_trig == "HeatTrig") and (valve_triggered == False)):
+                        try:
+                            valve_status = Set_Gas_Valve(True,1)
+                            valve_triggered = True
+                        except:
+                            print("Could not open gas valve")
     
         
             if ((agit_meas_read >= (agit_set_read-agit_tol)) and (agit_meas_read <= (agit_set_read+agit_tol)) and (stirr_on == True) and (((time()-ramp_1_0_time)/60)>steps_r[step_num-1])):
@@ -1491,6 +1712,12 @@ def Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,
                     timer_started = True
                     proc_status = "Timer Start"
                     window_3['-OUTPUT3_10-'].update(proc_status)
+                    if (((valve_trig == "AgitTrig") or (valve_trig == "BothTrig")) and (valve_triggered == False)):
+                        try:
+                            valve_status = Set_Gas_Valve(True,1)
+                            valve_triggered = True
+                        except:
+                            print("Could not open gas valve")
                     
                 if ((step_num < len(steps_s)) and (stirr_on == True)):
                     print("Partial ramp step reached")
@@ -1517,6 +1744,21 @@ def Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,
                 proc_status = "Finished"
                 window_3['-OUTPUT3_10-'].update(proc_status)
                 timer_stopped = True
+                try:
+                    valve_status = Set_Gas_Valve(False,1)
+                except:
+                    print("Could not close gas valve")
+
+                if (logs_on == True):
+                
+                    Save_Logs(log_dict,log_headings,times,temp_sps,temp_ms,temp_ex_ms,speed_sps,speed_ms,\
+                                  heat_pows,stirr_stats,err_stats,proc_stats)
+
+                sleep(5)
+
+                sg.popup("Process Finished")
+                
+                break
     
         if ((logs_on == True) and (time()-log_step_0)>log_step_size):
     
@@ -1525,7 +1767,8 @@ def Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,
             print('Logged Parameters')
             print('Time (s): '+str(time_log))
             print('Temp Setpoint (C): '+str(temp_set_read))
-            print('Temp Measured (C): '+str(temp_meas))
+            print('Temp Internal (C): '+str(temp_meas))
+            print('Temp External (C): '+str(temp_meas_ext))
             print('Speed Setpoint (RPM): '+str(agit_set_read))
             print('Speed Measured (RPM): '+str(agit_meas_read))
             
@@ -1538,6 +1781,7 @@ def Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,
             times.append(str(time_log))
             temp_sps.append(str(temp_set_read))
             temp_ms.append(str(temp_meas))
+            temp_ex_ms.append(str(temp_meas_ext))
             speed_sps.append(str(agit_set_read))
             speed_ms.append(str(agit_meas_read))
             heat_pows.append(str(heat_per))
@@ -1558,17 +1802,23 @@ def Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,
                 times.append(str(time_log))
                 temp_sps.append(str(temp_set_read))
                 temp_ms.append(str(temp_meas))
+                temp_ex_ms.append(str(temp_meas_ext))
                 speed_sps.append(str(agit_set_read))
                 speed_ms.append(str(agit_meas_read))
                 heat_pows.append(str(heat_per))
                 stirr_stats.append(str(stirr_is_on))
                 err_stats.append(str(error_str))
                 proc_stats.append(str(proc_status))
-        
-                sg.popup("Motor Current Error, Please Reset RS9000")
+
+                try:
+                    valve_status = Set_Gas_Valve(False,1)
+                except:
+                    print("Could not close gas valve")
                 
-                Save_Logs(log_dict,log_headings,times,temp_sps,temp_ms,speed_sps,speed_ms,\
+                Save_Logs(log_dict,log_headings,times,temp_sps,temp_ms,temp_ex_ms,speed_sps,speed_ms,\
                               heat_pows,stirr_stats,err_stats,proc_stats)
+
+            sg.popup("Motor Current Error, Please Reset RS9000")
                     
             break
         
@@ -1579,10 +1829,14 @@ def Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,
             stirr_on = False
             Set_On_Off(stirr_on, heat_on, sound_sh_on, sound_m_on, sound_l_on, devaddr, ram_HS_OnOff, max_wait)
             print("Aborting Process...")
+            try:
+                valve_status = Set_Gas_Valve(False,1)
+            except:
+                print("Could not close gas valve")
     
             if (logs_on == True):
                 
-                Save_Logs(log_dict,log_headings,times,temp_sps,temp_ms,speed_sps,speed_ms,\
+                Save_Logs(log_dict,log_headings,times,temp_sps,temp_ms,temp_ex_ms,speed_sps,speed_ms,\
                               heat_pows,stirr_stats,err_stats,proc_stats)
                 
             break
@@ -1592,8 +1846,10 @@ def Process_Monitor_Dialog(steps_s,steps_r,segs,step_num,first_both,first_stirr,
     
             if (logs_on == True):
                 
-                Save_Logs(log_dict,log_headings,times,temp_sps,temp_ms,speed_sps,speed_ms,\
+                Save_Logs(log_dict,log_headings,times,temp_sps,temp_ms,temp_ex_ms,speed_sps,speed_ms,\
                               heat_pows,stirr_stats,err_stats,proc_stats)
+                
+                sg.popup("Process will continue with monitor closed")
 
             
             break
